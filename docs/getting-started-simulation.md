@@ -84,13 +84,13 @@ What is there:
 - `hw/testbenches/systolic_array/test_systolic_array.py`: three tests against numpy:
   1. identity weights,
   2. 50 random vectors back to back (including −128 edge cases),
-  3. a **tiled dense layer** (8×16 @ 16×8 split into 4×4 tiles, then ReLU). This is the same pattern a real model layer uses.
+  3. a **tiled dense layer** (8×13 @ 13×7 split into N×N tiles with zero-padded edges, then ReLU). This is the same pattern a real model layer uses.
 
 I checked that the tests catch bugs: flipping `+` to `−` in the PE makes all three fail. [Certain]
 
 **Exercises to learn the design:**
 
-- Run a bigger array: `ARRAY_N=8 python3 -m pytest hw/testbenches/systolic_array`. I tested N = 2, 4 and 8, and all pass. [Certain]
+- Run a bigger array: `ARRAY_N=8 python3 -m pytest hw/testbenches/systolic_array`. I tested N = 2, 3, 4, 8 and 16, and all pass. [Certain]
 - Dump a waveform (`waves=True` in `runner.test(...)`) and watch the diagonal wave of data in GTKWave.
 
 ### Step 2: Build the golden model in Python (no hardware yet)

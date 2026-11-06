@@ -4,3 +4,4 @@ sim_build/
 *.vcd
 *.fst
 results.xml
+*.result.xml

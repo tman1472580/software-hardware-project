@@ -64,12 +64,20 @@ async def run_vectors(dut, A):
     """Stream the rows of A back to back; return the results in order."""
     results = []
 
+    # Results must arrive within the documented latency (2N - 1 cycles) after
+    # the last input. Bound the wait so a broken y_valid fails instead of hanging.
+    max_cycles = len(A) + 2 * N + 2
+
     async def collect():
-        while len(results) < len(A):
+        for _ in range(max_cycles):
             await RisingEdge(dut.clk)
             await ReadOnly()
             if dut.y_valid.value == 1:
                 results.append(unpack(dut.y_data.value, N, ACC))
+                if len(results) == len(A):
+                    return
+        raise AssertionError(
+            f"got {len(results)} of {len(A)} results within {max_cycles} cycles")
 
     collector = cocotb.start_soon(collect())
     for row in A:
@@ -119,20 +127,28 @@ async def test_random_stream(dut):
 
 @cocotb.test()
 async def test_tiled_dense_layer(dut):
-    """A tiny model layer: x (8x16) @ W (16x8) done as 4x4 tiles, then ReLU.
+    """A tiny model layer: x (8x13) @ W (13x7) done as N x N tiles, then ReLU.
 
     This is the pattern a real model uses: the software splits big matrices
-    into tiles the array can hold and adds up the partial results.
+    into tiles the array can hold and adds up the partial results. The sizes
+    are deliberately not multiples of N, so edge tiles are zero-padded to
+    N x N and the extra output columns are trimmed.
     """
     rng = np.random.default_rng(1)
     await start(dut)
-    X = rand_int8(rng, (8, 16))
-    W = rand_int8(rng, (16, 8))
-    out = np.zeros((8, 8), dtype=np.int64)
-    for k in range(0, 16, N):          # tile along the shared dimension
-        for j in range(0, 8, N):       # tile along the output dimension
-            await load_weights(dut, W[k:k + N, j:j + N])
-            out[:, j:j + N] += await run_vectors(dut, X[:, k:k + N])
+    M, K, J = 8, 13, 7
+    X = rand_int8(rng, (M, K))
+    W = rand_int8(rng, (K, J))
+    out = np.zeros((M, J), dtype=np.int64)
+    for k in range(0, K, N):           # tile along the shared dimension
+        for j in range(0, J, N):       # tile along the output dimension
+            w_tile = np.zeros((N, N), dtype=np.int64)
+            x_tile = np.zeros((M, N), dtype=np.int64)
+            wk, wj = min(N, K - k), min(N, J - j)
+            w_tile[:wk, :wj] = W[k:k + wk, j:j + wj]
+            x_tile[:, :wk] = X[:, k:k + wk]
+            await load_weights(dut, w_tile)
+            out[:, j:j + wj] += (await run_vectors(dut, x_tile))[:, :wj]
     out = np.maximum(out, 0)           # ReLU
     expected = np.maximum(X @ W, 0)
     assert (out == expected).all()
