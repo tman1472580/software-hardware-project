@@ -1,0 +1,4 @@
+# Python tools for RTL testbenches and golden models
+cocotb==2.1.0
+pytest
+numpy
