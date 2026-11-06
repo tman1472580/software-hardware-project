@@ -177,19 +177,40 @@ What this means:
 
 1. **A bigger array does not make token generation faster.** Even 16 × 16 has twice the math decode can use. [Likely]
 2. **Array size is a prefill (time-to-first-token) decision.** 32 × 32 is the sweet spot for this class of board. Packing two INT4 multiplies into one DSP slice (a known trick [Likely]) brings that to ~512 DSPs, which fits.
-3. **The real decode bottleneck is how fast weights get from DDR into the PEs.** This is the part most student TPU designs get wrong. See 6.3.
+3. **The real decode bottleneck is how fast weights get from DDR into the multipliers.** A textbook systolic array cannot take them fast enough at batch size 1. This is the part most student TPU designs get wrong. See 6.3.
 
 ### 6.3 The trap in a textbook weight-stationary array
 
 In a classic TPU array, weights shift in from the top, one row per cycle. Loading a 32 × 32 tile takes 32 cycles and delivers 32 weights per cycle = 16 bytes/cycle. At 250 MHz that is **4 GB/s**, a third of what the DDR can supply. [Likely]
 
-In prefill this does not matter, because each tile is reused for hundreds of tokens. In decode each tile is used **once**, so the array spends almost all its time loading weights, and **the weight load path, not DDR, becomes the limit**. You would get roughly a third of the possible tokens per second.
+The obvious fix, widening the load path, **does not work on its own**. The problem is *when* each PE can switch to its new weight.
 
-**Fix:** make the weight load path at least as wide as the DDR stream:
+**Cycle schedule for one tile (N = 32, M = number of tokens in the batch):**
 
-- Load **4 rows per cycle** (128 INT4 weights = 64 B/cycle = 16 GB/s at 250 MHz).
-- Keep TPU-style **shadow weight registers** so the next tile loads while the current one computes.
-- **Dequantise and unpack INT4 at the array edge**, not in DDR, so the memory traffic stays at half a byte per weight.
+- Activations enter skewed: row `r` gets its first value at cycle `r`, then it moves one column to the right each cycle. So PE `(r, c)` first sees tile data at cycle `r + c` and last sees it at cycle `r + c + M - 1`. [Certain, standard systolic timing]
+- The "use the new weight" signal must travel with the first activation of the next tile, so PE `(r, c)` switches at cycle `r + c + M`. The front of each tile is a diagonal wave that takes `2N - 1 = 63` cycles to cross the array.
+- With one shadow register per PE, PE `(r, c)` can only accept tile `k+2` after it switched to tile `k+1`. So the shadow for a PE is free for exactly `M` cycles, and those windows are staggered diagonally across the array.
+
+What that gives:
+
+| Phase | M | Shadow free window per PE | Load needed | Tile period | Result |
+|---|---|---|---|---|---|
+| Prefill, 512-token prompt | 512 | 512 cycles | 32 cycles (1 row/cycle) | 512 cycles | ✅ Textbook design is fine. Fill/drain overhead is 63/512 ≈ 12%. |
+| Prefill, short prompt | 64 | 64 cycles | 32 cycles | 64 cycles | ✅ Still fine. |
+| **Decode** | **1** | **1 cycle** | 8 cycles even at 4 rows/cycle | ≥ 32 cycles | ❌ About 1,024 weights per 32 cycles = 32 weights/cycle. Same 4 GB/s limit. |
+
+At M = 1 each PE's free window is one cycle, and it moves diagonally. A wider row-at-a-time load bus cannot hit a diagonal one-cycle window for all 32 PEs in a row. Making it work needs about `63 / 8 ≈ 8` shadow weight sets per PE plus weights stored in DDR in diagonal order. That is a lot of registers and a hard-to-verify design. [Likely]
+
+**Fix: give decode its own simple datapath.** Do not run batch-1 decode through the systolic array at all.
+
+- **GEMV engine:** 128 INT4 × INT8 multipliers feeding an adder tree. No systolic movement, so no switch hazard.
+- **Schedule:** each cycle, the DMA delivers 128 weights (64 bytes) from one row of the weight matrix. The matching 128 activations are already held in registers. One cycle = 128 MACs into one output's running sum. For a 2048 × 2048 matrix: `2048 / 128 = 16` cycles per output, × 2048 outputs = 32,768 cycles for 4.2 M weights = **128 weights/cycle, 16 GB/s at 250 MHz**. That is above the ~13 GB/s DDR delivers, so DDR stays the limit, which is what you want. [Likely, arithmetic]
+- **Cost:** about 64 DSP slices with INT4 packing, small next to the ~512 for the array. [Likely]
+- **Dequantise and unpack INT4 at the engine input**, not in DDR, so memory traffic stays at half a byte per weight.
+
+The systolic array stays textbook: one shadow register, one-row-per-cycle load. It only runs prefill (and batched decode if you ever add it, once M ≥ 32).
+
+**This schedule is a paper estimate.** The simulator in 6.6 step 1 should reproduce both tile periods before any RTL is written.
 
 ### 6.4 Proposed block diagram (v0.1)
 
@@ -203,11 +224,13 @@ In prefill this does not matter, because each tile is reused for hundreds of tok
         │        │                     │ weights (INT4)      │ activations    │
         │        │              ┌──────▼──────┐        ┌─────▼──────┐         │
         │        │              │ INT4 unpack │        │ Act buffer │ (BRAM)  │
-        │        │              │ + 4-row load│        │  INT8      │         │
+        │        │              │ + dequant   │        │  INT8      │         │
         │        │              └──────┬──────┘        └─────┬──────┘         │
         │        │                ┌────▼──────────────────────▼───┐           │
-        │        └──────────────► │  32×32 weight-stationary array │           │
-        │                         │  INT4 × INT8 → INT32           │           │
+        │        └──────────────► │ PREFILL: 32×32 weight-stationary│           │
+        │                         │   systolic array               │           │
+        │                         │ DECODE: 128-lane GEMV engine   │           │
+        │                         │ both INT4 × INT8 → INT32       │           │
         │                         └────────────┬───────────────────┘           │
         │                         ┌────────────▼───────────────────┐           │
         │                         │ Accumulators + per-group scale │ (URAM)    │
@@ -225,7 +248,7 @@ Design choices and why:
 | Choice | Borrowed from | Reason |
 |---|---|---|
 | Weight-stationary systolic array, 32 × 32 | TPU | Simplest dense compute; deterministic, easy to simulate |
-| Wide weight load + shadow registers | TPU, fixed for decode | Section 6.3 |
+| Separate 128-lane GEMV engine for decode | NPU-style specialisation | Section 6.3: a systolic array cannot take weights fast enough at batch size 1 |
 | Vector unit on the FPGA | NPU, later TPUs | Without it, every layer bounces to the ARM for norm/softmax: ~22 layers × several ops per token of round trips and cache flushes |
 | Scratchpad + DMA, no caches | NPU | Predictable timing; the compiler/engine plans all data movement |
 | Shared DDR with the ARM, AXI not PCIe | NPU | On a Zynq board the CPU is on the same chip. PCIe (as the README mentions) only applies if you use a separate host PC. [Likely] |
@@ -240,16 +263,17 @@ Design choices and why:
 | `DMA_LOAD dst, src, len` | DDR → on-chip buffer |
 | `DMA_STORE dst, src, len` | On-chip buffer → DDR |
 | `LOAD_W tile` | Weight buffer → shadow weight registers |
-| `MATMUL act, acc, rows, accumulate` | Stream activations through the array, write or add to accumulators |
+| `MATMUL act, acc, rows, accumulate` | Prefill: stream activations through the array, write or add to accumulators |
+| `GEMV w_src, act, acc, rows, cols` | Decode: stream weights from DMA through the GEMV engine |
 | `VEC op, src, dst` | Vector unit: norm, softmax, SiLU, RoPE, add, requantise |
 | `SYNC` / `FENCE` | Wait for DMA or compute to finish |
 | `HALT` | Signal done to the ARM |
 
 ### 6.6 Build order (de-risk first)
 
-1. **Simulator before RTL.** A cycle-approximate Python model of the array + DMA in `bridge/simulator/`. Use it to confirm the decode ceiling and the load-path issue before writing any Verilog.
+1. **Simulator before RTL.** A cycle-approximate Python model of the array + DMA in `bridge/simulator/`. Use it to confirm the decode ceiling and the tile periods in 6.3 before writing any Verilog.
 2. **4 × 4 array in RTL** with a testbench, checked against the simulator bit for bit.
-3. Scale to 32 × 32, add the wide weight load.
+3. Scale to 32 × 32. Add the GEMV engine for decode.
 4. DMA + command processor, then the vector unit.
 5. On board: the 2 × 2 "hello world" from the README, then one transformer layer, then the full model.
 
